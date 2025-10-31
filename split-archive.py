@@ -37,6 +37,8 @@ class STLArchiverApp(tk.Tk):
 
         self.current_folder = tk.StringVar(value="")
         self.sevenz_path = find_sevenz()
+        self.file_names = []
+        self.archived_counts = {}
 
         self._build_ui()
         self._bind_events()
@@ -119,6 +121,7 @@ class STLArchiverApp(tk.Tk):
         folder = self.current_folder.get()
         self.files_list.delete(0, tk.END)
         self.count_label.config(text="0 files")
+        self.file_names = []
         if not folder or not os.path.isdir(folder):
             self.status.set("Choose a valid folder.")
             return
@@ -129,8 +132,9 @@ class STLArchiverApp(tk.Tk):
                 if os.path.isfile(os.path.join(folder, f)) and f.lower().endswith(".stl")
             ]
             names.sort(key=lambda s: s.lower())
+            self.file_names = names
             for name in names:
-                self.files_list.insert(tk.END, name)
+                self.files_list.insert(tk.END, self._format_display_name(name))
             self.count_label.config(text=f"{len(names)} files")
             self.status.set(f"Loaded {len(names)} STL file(s).")
         except Exception as e:
@@ -164,10 +168,19 @@ class STLArchiverApp(tk.Tk):
             messagebox.showwarning("No folder", "Please choose a valid folder first.")
             return
 
-        selection = [self.files_list.get(i) for i in self.files_list.curselection()]
+        selection = [self.file_names[i] for i in self.files_list.curselection()]
         if not selection:
             messagebox.showwarning("No files selected", "Select one or more STL files to archive.")
             return
+
+        already_archived = [name for name in selection if self.archived_counts.get(self._file_key(name), 0) > 0]
+        if already_archived:
+            formatted = "\n".join(already_archived)
+            messagebox.showwarning(
+                "Already archived",
+                "The following files have been archived before:\n\n"
+                f"{formatted}\n\nArchiving them again will create duplicates in the new archive."
+            )
 
         # Check/find 7z
         sevenz = self.sevenz_path or find_sevenz()
@@ -218,6 +231,7 @@ class STLArchiverApp(tk.Tk):
             if proc.returncode == 0:
                 messagebox.showinfo("Success", f"Created archive:\n{archive_path}")
                 self.status.set("Archive created successfully.")
+                self._mark_files_archived(selection)
             else:
                 # Show output to help diagnose
                 messagebox.showerror("7-Zip error", f"7-Zip returned code {proc.returncode}.\n\nOutput:\n{proc.stdout}")
@@ -230,6 +244,38 @@ class STLArchiverApp(tk.Tk):
             self.status.set("Archiving failed.")
         finally:
             self.archive_btn.state(["!disabled"])
+
+    def _file_key(self, name):
+        folder = self.current_folder.get()
+        return os.path.join(folder, name)
+
+    def _format_display_name(self, name):
+        count = self.archived_counts.get(self._file_key(name), 0)
+        if count <= 0:
+            return name
+        if count == 1:
+            return f"{name} (archived)"
+        return f"{name} (archived ×{count})"
+
+    def _mark_files_archived(self, names):
+        current_selection = set(self.files_list.curselection())
+        updated_indexes = set()
+        for name in names:
+            key = self._file_key(name)
+            self.archived_counts[key] = self.archived_counts.get(key, 0) + 1
+            for idx, listed_name in enumerate(self.file_names):
+                if listed_name == name:
+                    updated_indexes.add(idx)
+
+        for idx in sorted(updated_indexes):
+            display = self._format_display_name(self.file_names[idx])
+            self.files_list.delete(idx)
+            self.files_list.insert(idx, display)
+            if idx in current_selection:
+                self.files_list.selection_set(idx)
+
+        if updated_indexes:
+            self.update_status_selection()
 
 def main():
     app = STLArchiverApp()
