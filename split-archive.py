@@ -5,8 +5,10 @@ import shutil
 import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import zipfile
+import re
 
-APP_TITLE = "STL Archiver (7-Zip)"
+APP_TITLE = "STL Archiver"
 
 def find_sevenz():
     """Try to find the 7z/7z.exe binary. Return absolute path or None."""
@@ -39,6 +41,7 @@ class STLArchiverApp(tk.Tk):
         self.sevenz_path = find_sevenz()
         self.file_names = []
         self.archived_counts = {}
+        self.last_archive_path = None
 
         self._build_ui()
         self._bind_events()
@@ -182,34 +185,44 @@ class STLArchiverApp(tk.Tk):
                 f"{formatted}\n\nArchiving them again will create duplicates in the new archive."
             )
 
-        # Check/find 7z
-        sevenz = self.sevenz_path or find_sevenz()
-        if not sevenz or not os.path.isfile(sevenz):
-            if not messagebox.askyesno(
-                "7-Zip not found",
-                "7-Zip (7z/7z.exe) was not found. Do you want to locate it now?"
-            ):
-                return
-            self.set_sevenz_path()
-            sevenz = self.sevenz_path
-
-        if not sevenz or not os.path.isfile(sevenz):
-            messagebox.showerror("7-Zip required", "Cannot proceed without a valid 7-Zip executable.")
-            return
-
         # Ask for archive filename
-        default_name = "stl_archive.7z"
+        default_name = "stl_archive.zip"
+        initialdir = (
+            os.path.dirname(self.last_archive_path)
+            if self.last_archive_path
+            else (folder or os.path.expanduser("~"))
+        )
+        initialfile = self._suggest_next_archive_name(default_name)
         archive_path = filedialog.asksaveasfilename(
             title="Save archive as",
-            defaultextension=".7z",
-            initialfile=default_name,
-            filetypes=[("7-Zip archive", "*.7z"), ("Zip archive", "*.zip"), ("All files", "*.*")]
+            defaultextension=".zip",
+            initialdir=initialdir,
+            initialfile=initialfile,
+            filetypes=[("Zip archive", "*.zip"), ("7-Zip archive", "*.7z"), ("All files", "*.*")]
         )
         if not archive_path:
             return
 
-        # If user picked .zip we can still call 7z with 'a' and it will infer by extension.
-        # Run 7z in the target folder to avoid long absolute paths.
+        archive_ext = os.path.splitext(archive_path)[1].lower()
+        use_zip = archive_ext in ("", ".zip")
+
+        sevenz = None
+        if not use_zip:
+            sevenz = self.sevenz_path or find_sevenz()
+            if not sevenz or not os.path.isfile(sevenz):
+                if not messagebox.askyesno(
+                    "7-Zip not found",
+                    "7-Zip (7z/7z.exe) was not found. Do you want to locate it now?"
+                ):
+                    return
+                self.set_sevenz_path()
+                sevenz = self.sevenz_path
+
+            if not sevenz or not os.path.isfile(sevenz):
+                messagebox.showerror("7-Zip required", "Cannot proceed without a valid 7-Zip executable.")
+                return
+
+        # Run archive creation with UI feedback
         self.status.set("Archiving… please wait.")
         self.archive_btn.state(["disabled"])
         self.update_idletasks()
@@ -218,27 +231,18 @@ class STLArchiverApp(tk.Tk):
             # Ensure archive directory exists
             os.makedirs(os.path.dirname(archive_path) or ".", exist_ok=True)
 
-            # Build command
-            cmd = [sevenz, "a", archive_path] + selection
-            # Call 7z with cwd set to the chosen folder so relative filenames work
-            proc = subprocess.run(
-                cmd,
-                cwd=folder,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True
-            )
-            if proc.returncode == 0:
-                messagebox.showinfo("Success", f"Created archive:\n{archive_path}")
-                self.status.set("Archive created successfully.")
-                self._mark_files_archived(selection)
+            if use_zip:
+                self._create_zip_archive(archive_path, folder, selection)
             else:
-                # Show output to help diagnose
-                messagebox.showerror("7-Zip error", f"7-Zip returned code {proc.returncode}.\n\nOutput:\n{proc.stdout}")
-                self.status.set("Archiving failed.")
-        except FileNotFoundError:
-            messagebox.showerror("7-Zip not found", "The 7-Zip executable could not be executed.")
-            self.status.set("7-Zip not found.")
+                self._create_sevenz_archive(sevenz, archive_path, folder, selection)
+
+            messagebox.showinfo("Success", f"Created archive:\n{archive_path}")
+            self.status.set("Archive created successfully.")
+            self._mark_files_archived(selection)
+            self.last_archive_path = archive_path
+        except RuntimeError as e:
+            messagebox.showerror("Archiving error", str(e))
+            self.status.set("Archiving failed.")
         except Exception as e:
             messagebox.showerror("Error", f"An error occurred while archiving:\n{e}")
             self.status.set("Archiving failed.")
@@ -248,6 +252,19 @@ class STLArchiverApp(tk.Tk):
     def _file_key(self, name):
         folder = self.current_folder.get()
         return os.path.join(folder, name)
+
+    def _suggest_next_archive_name(self, fallback_name):
+        if not self.last_archive_path:
+            return fallback_name
+
+        base = os.path.basename(self.last_archive_path)
+        name, ext = os.path.splitext(base)
+        match = re.search(r"(.*?)(\d+)$", name)
+        if match:
+            prefix, digits = match.groups()
+            incremented = str(int(digits) + 1).zfill(len(digits))
+            return f"{prefix}{incremented}{ext}"
+        return base
 
     def _format_display_name(self, name):
         count = self.archived_counts.get(self._file_key(name), 0)
@@ -276,6 +293,23 @@ class STLArchiverApp(tk.Tk):
 
         if updated_indexes:
             self.update_status_selection()
+
+    def _create_zip_archive(self, archive_path, folder, names):
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for name in names:
+                zf.write(os.path.join(folder, name), arcname=name)
+
+    def _create_sevenz_archive(self, sevenz, archive_path, folder, names):
+        cmd = [sevenz, "a", archive_path] + names
+        proc = subprocess.run(
+            cmd,
+            cwd=folder,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"7-Zip returned code {proc.returncode}.\n\nOutput:\n{proc.stdout}")
 
 def main():
     app = STLArchiverApp()
